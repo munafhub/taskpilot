@@ -1,0 +1,16 @@
+flowchart LR
+  UI["React UI (Vite)"] -->|"/api/agent"| API["Express API"]
+  UI -->|"/api/tasks, /api/traces"| API
+  API --> SUP["Supervisor agent"]
+  SUP -->|plan| MODEL["Model client (mock or Claude)"]
+  SUP --> W1["taskkeeper worker"]
+  SUP --> W2["analyst worker"]
+  SUP --> W3["scheduler worker"]
+  W1 & W2 & W3 --> REG["Tool registry (validated, traced)"]
+  API --> REG
+  MCPS["MCP server (stdio)"] --> REG
+  CLIENT["MCP client: Claude Code / custom"] -->|JSON-RPC| MCPS
+  REG --> STORE[("tasks.json")]
+  SUP -.spans.-> TRACE[("traces.jsonl")]
+  REG -.spans.-> TRACE
+  MCPS -.spans.-> TRACE

@@ -1,0 +1,17 @@
+{
+  "name": "taskpilot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TaskPilot: a task manager with an MCP server and a supervisor/worker agent crew (React + Express).",
+  "scripts": {
+    "install:all": "npm --prefix server install && npm --prefix client install",
+    "dev:server": "npm --prefix server run dev",
+    "dev:client": "npm --prefix client run dev",
+    "build": "npm --prefix client run build",
+    "start": "npm --prefix server start",
+    "mcp": "node server/mcp/server.js",
+    "mcp:demo": "node server/mcp/demo.js",
+    "agent": "node server/scripts/cli.js",
+    "smoke": "node server/scripts/smoke.js"
+  }
+}

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+server/data/*.json
+server/data/*.jsonl
+server/data/*.tmp
+
+.env.*
+!.env.example
+coverage/
