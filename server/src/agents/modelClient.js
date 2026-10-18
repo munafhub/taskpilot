@@ -1,45 +1,67 @@
-// Model client. Mock mode is deterministic (tests, CI, offline, zero cost).
-// Live mode asks a small Claude model for a routing plan, validates the JSON,
-// and falls back to the mock planner if anything is off.
+
 import { span } from '../tracer.js';
 
 export const WORKER_NAMES = ['taskkeeper', 'analyst', 'scheduler'];
 const MAX_STEPS = 5;
 
-export const modelMode = () => process.env.MODEL_MODE || (process.env.ANTHROPIC_API_KEY ? 'live' : 'mock');
-export const modelName = () => process.env.ANTHROPIC_MODEL || 'claude-haiku-5-5';
+export const modelMode = () =>
+  process.env.MODEL_MODE ||
+  (process.env.GEMINI_API_KEY ? 'live' : 'mock');
 
-/** Output validation = guardrail. Throws if the plan is not usable. */
+export const modelName = () =>
+  process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+
 export function validatePlan(plan) {
-  if (!plan || !Array.isArray(plan.steps)) throw new Error('plan.steps must be an array');
-  if (plan.steps.length > MAX_STEPS) throw new Error(`plan has ${plan.steps.length} steps; max is ${MAX_STEPS}`);
+  if (!plan || !Array.isArray(plan.steps)) {
+    throw new Error('plan.steps must be an array');
+  }
+
+  if (plan.steps.length > MAX_STEPS) {
+    throw new Error(`plan has too many steps; max is ${MAX_STEPS}`);
+  }
+
   const steps = plan.steps.map((s, i) => {
     if (!s || !WORKER_NAMES.includes(s.worker)) {
-      throw new Error(`step ${i}: worker must be one of ${WORKER_NAMES.join(', ')}; got ${JSON.stringify(s?.worker)}`);
+      throw new Error(`step ${i}: invalid worker`);
     }
-    if (typeof s.instruction !== 'string' || !s.instruction.trim()) throw new Error(`step ${i}: instruction must be a non-empty string`);
-    return { worker: s.worker, instruction: s.instruction.trim() };
+
+    if (typeof s.instruction !== 'string' || !s.instruction.trim()) {
+      throw new Error(`step ${i}: instruction must not be empty`);
+    }
+
+    return {
+      worker: s.worker,
+      instruction: s.instruction.trim(),
+    };
   });
+
   return { steps };
 }
 
-const SPLIT = /\s*(?:;|\bthen\b|\band\s+(?=(?:summari[sz]e|plan|schedule|show|list|prioriti[sz]e|mark|complete|finish|add|create)\b))\s*/i;
+const SPLIT =
+  /\s*(?:;|\bthen\b|\band\s+(?=(?:summari[sz]e|plan|schedule|show|list|prioriti[sz]e|mark|complete|finish|add|create)\b))\s*/i;
 
 function classifyClause(clause) {
   const c = clause.trim();
   if (!c) return null;
+
   if (/^(add|create|new|remind me to)\b/i.test(c)) return 'taskkeeper';
   if (/^(mark|complete|finish|done with)\b/i.test(c)) return 'taskkeeper';
   if (/\b(plan|schedule|prioriti[sz]e|focus|what should i)\b/i.test(c)) return 'scheduler';
   if (/\b(summari[sz]e|stats|workload|how many|overdue|status|show|list)\b/i.test(c)) return 'analyst';
+
   return null;
 }
 
 export function mockPlan(request) {
   const steps = request
     .split(SPLIT)
-    .map((clause) => ({ worker: classifyClause(clause), instruction: clause.replace(/^[\s,.;:]+|[\s,.;:]+$/g, '') }))
+    .map((clause) => ({
+      worker: classifyClause(clause),
+      instruction: clause.replace(/^[\s,.;:]+|[\s,.;:]+$/g, ''),
+    }))
     .filter((s) => s.worker);
+
   return { steps };
 }
 
@@ -49,32 +71,74 @@ Reply with ONLY JSON: {"steps":[{"worker":"taskkeeper|analyst|scheduler","instru
 Use at most ${MAX_STEPS} steps. If the request is unrelated to tasks, return {"steps":[]}.`;
 
 async function livePlan(request) {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error('GEMINI_API_KEY is missing from server/.env');
+
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/${modelName()}:generateContent?key=${apiKey}`;
+
+  const res = await fetch(url, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': process.env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({ model: modelName(), max_tokens: 400, system: SYSTEM, messages: [{ role: 'user', content: request }] }),
-    signal: AbortSignal.timeout(15000),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      systemInstruction: {
+        parts: [{ text: SYSTEM }],
+      },
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: request }],
+        },
+      ],
+      generationConfig: {
+        temperature: 0.1,
+        responseMimeType: 'application/json',
+      },
+    }),
+    signal: AbortSignal.timeout(20000),
   });
-  if (!res.ok) throw new Error(`Anthropic API returned ${res.status}`);
+
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`Gemini API returned ${res.status}: ${detail.slice(0, 300)}`);
+  }
+
   const data = await res.json();
-  const text = (data.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('');
-  return validatePlan(JSON.parse(text.replace(/```json|```/g, '').trim()));
+  const text = data.candidates?.[0]?.content?.parts
+    ?.map((part) => part.text || '')
+    .join('');
+
+  if (!text) throw new Error('Gemini returned an empty response');
+
+  return validatePlan(JSON.parse(text));
 }
 
 export async function planRequest(request) {
   const mode = modelMode();
-  return span({ kind: 'model', name: `plan:${mode}`, input: { request, model: mode === 'live' ? modelName() : 'mock' } }, async () => {
-    if (mode === 'live') {
-      try {
-        return { ...(await livePlan(request)), source: 'live' };
-      } catch (err) {
-        return { ...validatePlan(mockPlan(request)), source: 'mock-fallback', fallbackReason: err.message };
+
+  return span(
+    {
+      kind: 'model',
+      name: `plan:${mode}`,
+      input: {
+        request,
+        model: mode === 'live' ? modelName() : 'mock',
+      },
+    },
+    async () => {
+      if (mode === 'live') {
+        try {
+          return { ...(await livePlan(request)), source: 'live' };
+        } catch (err) {
+          return {
+            ...validatePlan(mockPlan(request)),
+            source: 'mock-fallback',
+            fallbackReason: err.message,
+          };
+        }
       }
+
+      return { ...validatePlan(mockPlan(request)), source: 'mock' };
     }
-    return { ...validatePlan(mockPlan(request)), source: 'mock' };
-  });
+  );
 }
